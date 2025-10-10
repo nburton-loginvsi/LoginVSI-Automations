@@ -25,9 +25,23 @@ public class Win32 {
 }
 "@ | Out-Null
 
-$windows = New-Object System.Collections.Generic.List[Object]
+# Function to get username from process owner via WMI (reliable and works cross-session)
+function Get-ProcessOwner {
+    param([int]$ProcId)
+    try {
+        $p = Get-WmiObject Win32_Process -Filter "ProcessId = $ProcId" -ErrorAction Stop
+        $out = $p.GetOwner()
+        if ($out.Domain -and $out.User) {
+            return "$($out.Domain)\$($out.User)"
+        } else {
+            return "SYSTEM"
+        }
+    } catch {
+        return "Unknown"
+    }
+}
 
-# Suppress all non-terminating errors inside script block
+$windows = New-Object System.Collections.Generic.List[Object]
 $ErrorActionPreference = 'SilentlyContinue'
 
 [Win32]::EnumWindows({
@@ -40,31 +54,37 @@ $ErrorActionPreference = 'SilentlyContinue'
                 $sb = New-Object System.Text.StringBuilder -ArgumentList ($len + 1)
                 [Win32]::GetWindowText($hWnd, $sb, $sb.Capacity) | Out-Null
                 $title = $sb.ToString().Trim()
+
                 if (-not [string]::IsNullOrWhiteSpace($title)) {
                     [uint32]$procId = 0
                     [Win32]::GetWindowThreadProcessId($hWnd, [ref]$procId) | Out-Null
+
                     try {
                         $proc = Get-Process -Id $procId -ErrorAction Stop
                         $procName = $proc.ProcessName
                     } catch {
                         $procName = "Unknown"
                     }
+
+                    $user = Get-ProcessOwner -ProcId $procId
+
                     $windows.Add([PSCustomObject]@{
                         Handle  = ('0x{0:X8}' -f $hWnd.ToInt64())
                         PID     = $procId
                         Process = $procName
+                        User    = $user
                         Title   = $title
                     })
                 }
             }
         }
     } catch {
-        # silently ignore any exceptions per window
+        # ignore
     }
 
     return $true
 }, [IntPtr]::Zero) | Out-Null
 
 $windows |
-    Sort-Object Process, Title |
-    Format-Table -AutoSize Handle, PID, Process, Title
+    Sort-Object User, Process, Title |
+    Format-Table -AutoSize Handle, PID, Process, User, Title
