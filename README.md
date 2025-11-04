@@ -1,5 +1,5 @@
 # LoginVSI-Automations
-A general-purpose repo for various automation tasks. Originally created for grabbing specific Launcher versions.\
+A general-purpose repo for various automation tasks. Originally created for grabbing specific Launcher versions.
 ---
 totp-tool\
 Used for testing TOTP generations, as well as extracting secrets from QR codes. This uses Zxing.org's POST capabilities, so https/tcp-443 to their site must be allowed.
