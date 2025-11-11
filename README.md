@@ -16,6 +16,7 @@ Used for testing TOTP generations, as well as extracting secrets from QR codes. 
 ---
 
 **Get-LEScreenshots.ps1**
+
 Used for fetching all screenshots from an appliance using a mix of the events and screenshots APIs. Example use:
 .\Get-LEScreenshots.ps1 -BaseUrl "https://nick-loginent2.nick.local" -ApiKey "eyJ..." -OutDir "C:\Temp\LE" -TrustAllCerts
 
