@@ -1,48 +1,47 @@
 # Get-LEScreenshots.ps1
 # PowerShell 5.x compatible
-# Downloads screenshots for events of type scriptScreenshot or applicationFailure.
+# Uses /publicApi/v7/events?direction=<asc|desc>&count=<N>
 # Directory per TEST RUN: "<TestRunId>"
-# File name per event: "<EventTitle>__<EventTimestampUTC><ext>" (title sanitized; ext auto-detected via Content-Type).
-#
-# Example:
-#   .\Get-LEScreenshots.ps1 -BaseUrl "https://nick-loginent2.nick.local" -ApiKey "eyJ..." -OutDir "C:\Temp\LE" -TrustAllCerts
+# Filename per event: "<EventTitle>__<EventTimestampUTC><ext>"
+# Ext auto-detected by magic bytes (and Content-Type when available).
+# Handles response shape with top-level {"items":[ ... ]}.
 
 param(
     [Parameter(Mandatory=$true)]
-    [string]$BaseUrl,                           # e.g. https://your-le-server
+    [string]$BaseUrl,
 
-    [string]$TestRunId,                         # optional: limit to one test run
-    [string]$OutDir = ".\LEScreenshots",        # where to save files
+    [string]$OutDir = ".\LEScreenshots",
 
-    [string]$ApiKey,                            # treated as Bearer token
-    [string]$BearerToken,                       # Authorization: Bearer <token>
+    [string]$BearerToken,
+    [string]$ApiKey,
 
-    [switch]$TrustAllCerts,                     # ignore TLS errors (lab boxes)
-    [int]$PageSize = 500                        # best-effort paging if supported
+    [ValidateSet('asc','desc')]
+    [string]$Direction = "desc",
+
+    [int]$Count = 10000, # note that 10k is the max (default)
+
+    [string]$TestRunId,            # still need to test this for test run ID filter in future
+    [switch]$TrustAllCerts
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 
-# --- TLS / Cert handling for lab boxes ---
+# --- TLS handling ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 if ($TrustAllCerts) {
-    try {
-        if (-not ([System.Management.Automation.PSTypeName]'IgnoreCertPolicy').Type) {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
 @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
-public class IgnoreCertPolicy {
+public class TrustAllCerts {
     public static bool Validator(object sender, X509Certificate cert, X509Chain chain, System.Net.Security.SslPolicyErrors errors) {
         return true;
     }
 }
 "@ | Add-Type -Language CSharp
-        }
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$ch,$e) [IgnoreCertPolicy]::Validator($s,$c,$ch,$e) }
-    } catch {
-        Write-Warning "Could not install TrustAllCerts handler. Proceeding anyway."
     }
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$ch,$e) [TrustAllCerts]::Validator($s,$c,$ch,$e) }
 }
 
 # --- Headers ---
@@ -50,65 +49,10 @@ $headers = @{ 'Accept' = 'application/json' }
 if ($BearerToken) { $headers['Authorization'] = "Bearer $BearerToken" }
 elseif ($ApiKey)  { $headers['Authorization'] = "Bearer $ApiKey" }
 
-# --- Utils ---
-function Join-Url { param([string]$a,[string]$b) ($a.TrimEnd('/') + '/' + $b.TrimStart('/')) }
-
-function _HasProp { param($o,[string]$n) return ($o -is [pscustomobject]) -and ($o.PSObject.Properties.Name -contains $n) }
-
 function Ensure-Directory {
     param([Parameter(Mandatory=$true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) { $null = New-Item -ItemType Directory -Path $Path -Force }
     return (Get-Item -LiteralPath $Path).FullName
-}
-
-function Get-EventsPage {
-    param([string]$Url)
-
-    $resp = Invoke-WebRequest -Uri $Url -Headers $headers -Method GET -ErrorAction Stop
-    $obj  = $resp.Content | ConvertFrom-Json
-
-    $next = $null
-
-    # Link header pagination
-    $linkHeader = $resp.Headers['Link']
-    if ($linkHeader) {
-        foreach ($part in ($linkHeader -split ',')) {
-            if ($part -match '^\s*<([^>]+)>\s*;\s*rel="?next"?') { $next = $Matches[1]; break }
-        }
-    }
-
-    # JSON pagination variants
-    if (-not $next) {
-        if (_HasProp $obj 'next')       { $next = $obj.next }
-        elseif (_HasProp $obj 'nextUrl'){ $next = $obj.nextUrl }
-        elseif (_HasProp $obj 'links') {
-            $lnk = $obj.links
-            if (_HasProp $lnk 'next')   { $next = $lnk.next }
-        }
-        elseif (_HasProp $obj 'page') {
-            $pg = $obj.page
-            if (_HasProp $pg 'next')    { $next = $pg.next }
-        }
-    }
-
-    if ($next -and ($next -notmatch '^https?://')) { $next = ($BaseUrl.TrimEnd('/') + '/' + $next.TrimStart('/')) }
-
-    # Normalize items
-    $items = @()
-    if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string]) -and -not ($obj -is [pscustomobject])) {
-        $items = @($obj)
-    } elseif (_HasProp $obj 'items') {
-        $items = @($obj.items)
-    } elseif (_HasProp $obj 'data') {
-        $items = @($obj.data)
-    } else {
-        $items = @($obj)
-    }
-
-    [pscustomobject]@{
-        Items   = $items
-        NextUrl = $next
-    }
 }
 
 function Sanitize-Name {
@@ -122,169 +66,108 @@ function Sanitize-Name {
 }
 
 function Guess-Extension {
-    param([string]$contentType, [byte[]]$firstBytes)
-
-    if ($contentType) {
-        switch -regex ($contentType) {
-            'application/zip'   { return '.zip' }
-            'image/png'         { return '.png' }
-            'image/jpeg'        { return '.jpg' }
-            'image/gif'         { return '.gif' }
-        }
+    param([string]$ct,[byte[]]$bytes)
+    if ($ct) {
+        if ($ct -match 'image/png') { return '.png' }
+        if ($ct -match 'image/jpeg') { return '.jpg' }
+        if ($ct -match 'image/gif') { return '.gif' }
+        if ($ct -match 'application/zip') { return '.zip' }
     }
-
-    if ($firstBytes -and $firstBytes.Length -ge 4) {
-        if ($firstBytes[0] -eq 0x50 -and $firstBytes[1] -eq 0x4B -and (($firstBytes[2] -eq 0x03 -and $firstBytes[3] -eq 0x04) -or ($firstBytes[2] -eq 0x05 -and $firstBytes[3] -eq 0x06) -or ($firstBytes[2] -eq 0x07 -and $firstBytes[3] -eq 0x08))) {
-            return '.zip'
-        }
-        if ($firstBytes[0] -eq 0xFF -and $firstBytes[1] -eq 0xD8 -and $firstBytes[2] -eq 0xFF) {
-            return '.jpg'
-        }
-        if ($firstBytes.Length -ge 8 -and $firstBytes[0] -eq 0x89 -and $firstBytes[1] -eq 0x50 -and $firstBytes[2] -eq 0x4E -and $firstBytes[3] -eq 0x47 -and $firstBytes[4] -eq 0x0D -and $firstBytes[5] -eq 0x0A -and $firstBytes[6] -eq 0x1A -and $firstBytes[7] -eq 0x0A) {
-            return '.png'
-        }
-        if ($firstBytes[0] -eq 0x47 -and $firstBytes[1] -eq 0x49 -and $firstBytes[2] -eq 0x46 -and $firstBytes[3] -eq 0x38) {
-            return '.gif'
-        }
+    if ($bytes -and $bytes.Length -ge 4) {
+        if ($bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50 -and $bytes[2] -eq 0x4E -and $bytes[3] -eq 0x47) { return '.png' } # PNG
+        if ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xD8) { return '.jpg' } # JPEG
+        if ($bytes[0] -eq 0x47 -and $bytes[1] -eq 0x49 -and $bytes[2] -eq 0x46 -and $bytes[3] -eq 0x38) { return '.gif' } # GIF
+        if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B) { return '.zip' } # ZIP
     }
-
     return '.bin'
 }
 
-function Get-FilenameFromDisposition {
-    param([string]$cd)
-    if ($cd -and ($cd -match 'filename\*?="?([^";]+)')) { return $Matches[1] }
-    return $null
-}
+# --- Resolve/create OutDir ---
+$OutDirFull = Ensure-Directory -Path $OutDir
 
-# --- Resolve OutDir to an absolute path and ensure it exists ---
-$OutDir = Ensure-Directory -Path $OutDir
-
-# --- Build initial events URL ---
-$eventsUrl = Join-Url $BaseUrl "/publicApi/v7/events/"
-$qs = @()
-if ($TestRunId) { $qs += "testRunId=$([uri]::EscapeDataString($TestRunId))" }
-if ($PageSize  -gt 0) { $qs += "pageSize=$PageSize" }
-if ($qs.Count -gt 0) { $eventsUrl = "$eventsUrl`?$($qs -join '&')" }
+# --- Build events URL with correct params ---
+$eventsUrl = "$BaseUrl/publicApi/v7/events?direction=$Direction&count=$Count"
+if ($TestRunId) { $eventsUrl += "&testRunId=$([uri]::EscapeDataString($TestRunId))" }
 
 Write-Host "Fetching events from $eventsUrl"
 
-# --- Pull all pages ---
-$allEvents = New-Object System.Collections.ArrayList
-$nextUrl   = $eventsUrl
+# --- Fetch events (API returns wrapper with items) ---
+$resp = Invoke-WebRequest -Uri $eventsUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
+$root = $resp.Content | ConvertFrom-Json
 
-while ($nextUrl) {
-    $page = Get-EventsPage -Url $nextUrl
-    [void]$allEvents.AddRange($page.Items)
-    $nextUrl = $page.NextUrl
+# Normalize to an array of events
+$events = @()
+if ($root -and ($root.PSObject.Properties.Name -contains 'items') -and $root.items) {
+    $events = @($root.items)
+} else {
+    # some deployments may return a flat array
+    if ($root -is [System.Collections.IEnumerable] -and -not ($root -is [string])) {
+        $events = @($root)
+    }
 }
 
-if ($allEvents.Count -eq 0) { throw "Events API returned nothing. Check URL/auth." }
+if (-not $events -or $events.Count -eq 0) { throw "Events API returned no events in 'items'." }
 
-# --- Filter the two event types we care about ---
-$wantedTypes   = @('scriptScreenshot','applicationFailure')
-$targetEvents  = $allEvents | Where-Object { $_.eventType -in $wantedTypes }
+# --- Filter event types we want; require non-null testRunId so we can download screenshots
+$wantedTypes = @('scriptScreenshot','applicationFailure')
+$target = @($events | Where-Object { ($_.eventType -in $wantedTypes) -and $_.testRunId })
 
-Write-Host ("Found {0} events total; {1} are screenshot-related." -f $allEvents.Count, $targetEvents.Count)
+Write-Host ("Found {0} events total; {1} are screenshot-related with testRunId." -f $events.Count, $target.Count)
 
-if ($targetEvents.Count -eq 0) {
-    Write-Warning "No scriptScreenshot/applicationFailure events found. Nothing to download."
-    return
-}
+if ($target.Count -eq 0) { return }
 
-# --- Download screenshots for each event ---
 $downloadCount = 0
 $failCount     = 0
 
-foreach ($evt in $targetEvents) {
-    # Safe property fetches from event payload
-    $eventId = $null
-    if ($evt.PSObject.Properties.Name -contains 'id' -and $evt.id)        { $eventId = $evt.id }
-    elseif ($evt.PSObject.Properties.Name -contains 'eventId' -and $evt.eventId) { $eventId = $evt.eventId }
+foreach ($evt in $target) {
+    $eventId = $evt.id
+    $runId   = $evt.testRunId
+    $etype   = $evt.eventType
+    $title   = if ($evt.title) { $evt.title } else { $etype }
+    $tsRaw   = $evt.timestamp
 
-    $runId = $null
-    if ($evt.PSObject.Properties.Name -contains 'testRunId' -and $evt.testRunId) { $runId = $evt.testRunId }
-    elseif ($TestRunId) { $runId = $TestRunId }
+    if (-not $eventId -or -not $runId) { continue }
 
-    $etype = if ($evt.PSObject.Properties.Name -contains 'eventType') { $evt.eventType } else { 'event' }
-    $title = if ($evt.PSObject.Properties.Name -contains 'title') { $evt.title } else { $null }
-    $tsRaw = if ($evt.PSObject.Properties.Name -contains 'timestamp') { $evt.timestamp } else { $null }
-
-    if (-not $eventId) { Write-Warning "Event missing id. Skipping."; continue }
-    if (-not $runId)   { Write-Warning "Event missing testRunId. Skipping."; continue }
-
-    # Directory PER TEST RUN ID
-    $runDirName = $runId
-    $runDir = Ensure-Directory -Path (Join-Path $OutDir (Sanitize-Name $runDirName))
-
-    # Build filename: "<EventTitle>__<EventTimestampUTC><ext>"
-    if (-not $title) { $title = "{0}_{1}" -f $etype, $eventId }
-    $baseName = Sanitize-Name $title
+    $safeRun = Sanitize-Name $runId
+    $runDir  = Ensure-Directory -Path (Join-Path $OutDirFull $safeRun)
 
     $stamp = 'unknown'
     if ($tsRaw) {
-        try {
-            $dt = [DateTime]$tsRaw
-            $stamp = $dt.ToUniversalTime().ToString('yyyy-MM-dd_HHmmssZ')
+        try{
+            $stamp = ([DateTime]$tsRaw).ToUniversalTime().ToString('yyyy-MM-dd_HHmmssZ')
         } catch {
             $stamp = 'unknown'
         }
     }
 
-    $screensUrl = Join-Url $BaseUrl "/publicApi/v7/test-runs/$runId/events/$eventId/screenshots"
+    $safeTitle = Sanitize-Name $title
+    $screensUrl = "$BaseUrl/publicApi/v7/test-runs/$runId/events/$eventId/screenshots"
+    $tmp = Join-Path $runDir ("tmp_{0}" -f $eventId)
 
     try {
-        # Try HEAD for filename/content-type
-        $cd = $null; $ct = $null
+        # Attempt HEAD to get content-type (optional)
+        $ct = $null
         try {
             $head = Invoke-WebRequest -Uri $screensUrl -Headers $headers -Method Head -ErrorAction Stop
-            $cd   = $head.Headers['Content-Disposition']
-            $ct   = $head.Headers['Content-Type']
-        } catch {
-            # HEAD not supported
-        }
+            $ct = $head.Headers['Content-Type']
+        } catch {}
 
-        $tempPath = Join-Path $runDir ("tmp_{0}" -f $eventId)
-        Invoke-WebRequest -Uri $screensUrl -Headers $headers -Method GET -OutFile $tempPath -ErrorAction Stop
+        Invoke-WebRequest -Uri $screensUrl -Headers $headers -OutFile $tmp -ErrorAction Stop
+        $bytes = [System.IO.File]::ReadAllBytes($tmp)
+        $ext = Guess-Extension $ct $bytes
 
-        # Sniff first bytes
-        $fs = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        try {
-            $buf = New-Object byte[] 16
-            $read = $fs.Read($buf, 0, $buf.Length)
-            if ($read -lt $buf.Length -and $read -gt 0) { $buf = $buf[0..($read-1)] }
-        } finally {
-            $fs.Dispose()
-        }
+        $final = Join-Path $runDir ("{0}__{1}{2}" -f $safeTitle,$stamp,$ext)
+        Move-Item -LiteralPath $tmp -Destination $final -Force
 
-        $extFromType = Guess-Extension -contentType $ct -firstBytes $buf
-        $nameFromCD  = Get-FilenameFromDisposition -cd $cd
-
-        $finalName = $null
-        if ($nameFromCD) {
-            # Prefer server-provided filename, but append timestamp before extension
-            $safe = Sanitize-Name $nameFromCD
-            $ext  = [System.IO.Path]::GetExtension($safe)
-            if (-not $ext) { $ext = $extFromType }
-            $nameOnly = if ($ext) { $safe.Substring(0, $safe.Length - $ext.Length) } else { $safe }
-            $finalName = "{0}__{1}{2}" -f $nameOnly, $stamp, $ext
-        } else {
-            $finalName = "{0}__{1}{2}" -f $baseName, $stamp, $extFromType
-        }
-
-        $outPath = Join-Path $runDir $finalName
-        Move-Item -LiteralPath $tempPath -Destination $outPath -Force
-
-        Write-Host "[$etype] $eventId  ->  $outPath"
+        Write-Host "[$etype] $eventId -> $final"
         $downloadCount++
     } catch {
-        if (Test-Path $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
-        Write-Warning "Failed to download screenshots for event $eventId (testRun $runId): $($_.Exception.Message)"
+        if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        Write-Warning ("Failed ${eventId}: {0}" -f $_.Exception.Message)
         $failCount++
-        continue
     }
 }
 
 Write-Host ""
-Write-Host "Done. Downloads: $downloadCount, Failures: $failCount"
-Write-Host "Output: $(Resolve-Path $OutDir)"
+Write-Host ("Done. Downloads: {0}, Failures: {1}" -f $downloadCount, $failCount)
+Write-Host ("Output: {0}" -f $OutDirFull)
